@@ -91,14 +91,15 @@ impl<'a> NixCommand<'a> {
         let raw_cmd = format!("{cmd:?}");
         let cmd_hash = compute_string_hash(&raw_cmd);
 
-        // Check whether the command has been previously run and the files it depends on have not been changed.
-        if self.enable_caching
-            && !self.force_refresh
-            && let Ok(Some(output)) =
-                query_cached_output(self.pool, &cmd_hash, &self.extra_paths).await
-        {
-            return Ok(output);
-        }
+        // Check the cache if enabled
+        let cache_miss_reason = if self.enable_caching && !self.force_refresh {
+            match query_cached_output(self.pool, &cmd_hash, &raw_cmd, &self.extra_paths).await? {
+                CacheCheckResult::Hit(output) => return Ok(output),
+                CacheCheckResult::Miss(reason) => Some(reason),
+            }
+        } else {
+            None
+        };
 
         cmd.arg("-vv")
             .arg("--log-format")
@@ -235,7 +236,8 @@ impl<'a> NixCommand<'a> {
             stdout,
             stderr,
             inputs,
-            ..Default::default()
+            cache_hit: false,
+            cache_miss_reason,
         })
     }
 }
@@ -243,6 +245,84 @@ impl<'a> NixCommand<'a> {
 /// Check whether the command supports the flags required for caching.
 pub fn supports_eval_caching(cmd: &Command) -> bool {
     cmd.get_program().to_string_lossy().ends_with("nix")
+}
+
+/// Reason why the eval cache was not used.
+#[derive(Debug, Clone)]
+pub enum CacheMissReason {
+    /// Command was not found in the cache (first run).
+    NotCached,
+    /// One or more file inputs were modified.
+    FilesModified { paths: Vec<PathBuf> },
+    /// One or more file inputs were removed.
+    FilesRemoved { paths: Vec<PathBuf> },
+    /// One or more environment variables were modified.
+    EnvModified { names: Vec<String> },
+    /// One or more environment variables were removed.
+    EnvRemoved { names: Vec<String> },
+    /// The set of tracked inputs changed.
+    InputsChanged,
+}
+
+impl std::fmt::Display for CacheMissReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotCached => write!(f, "first evaluation"),
+            Self::FilesModified { paths } => {
+                if paths.len() == 1 {
+                    write!(f, "{} modified", paths[0].display())
+                } else {
+                    write!(f, "{} files modified: ", paths.len())?;
+                    for (i, path) in paths.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", path.display())?;
+                    }
+                    Ok(())
+                }
+            }
+            Self::FilesRemoved { paths } => {
+                if paths.len() == 1 {
+                    write!(f, "{} removed", paths[0].display())
+                } else {
+                    write!(f, "{} files removed: ", paths.len())?;
+                    for (i, path) in paths.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{}", path.display())?;
+                    }
+                    Ok(())
+                }
+            }
+            Self::EnvModified { names } => {
+                if names.len() == 1 {
+                    write!(f, "environment variable {} changed", names[0])
+                } else {
+                    write!(
+                        f,
+                        "{} environment variables changed: {}",
+                        names.len(),
+                        names.join(", ")
+                    )
+                }
+            }
+            Self::EnvRemoved { names } => {
+                if names.len() == 1 {
+                    write!(f, "environment variable {} removed", names[0])
+                } else {
+                    write!(
+                        f,
+                        "{} environment variables removed: {}",
+                        names.len(),
+                        names.join(", ")
+                    )
+                }
+            }
+            Self::InputsChanged => write!(f, "tracked inputs changed"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -257,9 +337,11 @@ pub struct Output {
     pub inputs: Vec<Input>,
     /// Whether the output was returned from the cache or not.
     pub cache_hit: bool,
+    /// If cache was missed, the reason why.
+    pub cache_miss_reason: Option<CacheMissReason>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Input {
     File(FileInputDesc),
     Env(EnvInputDesc),
@@ -270,6 +352,15 @@ impl Input {
         match self {
             Self::File(desc) => desc.content_hash.as_deref(),
             Self::Env(desc) => desc.content_hash.as_deref(),
+        }
+    }
+
+    /// Get the identifier for this input (path for files, name for env vars).
+    /// Used to compare inputs by identity rather than content.
+    pub fn identifier(&self) -> InputIdentifier {
+        match self {
+            Self::File(desc) => InputIdentifier::File(desc.path.clone()),
+            Self::Env(desc) => InputIdentifier::Env(desc.name.clone()),
         }
     }
 
@@ -310,7 +401,14 @@ impl Input {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Identifier for an input, used for comparing inputs by path/name rather than content.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+enum InputIdentifier {
+    File(PathBuf),
+    Env(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct FileInputDesc {
     pub path: PathBuf,
     pub is_directory: bool,
@@ -367,7 +465,7 @@ impl FileInputDesc {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct EnvInputDesc {
     pub name: String,
     pub content_hash: Option<String>,
@@ -433,6 +531,12 @@ impl From<db::EnvInputRow> for EnvInputDesc {
     }
 }
 
+/// Result from checking the cache - either a hit with output, or a miss with a reason.
+enum CacheCheckResult {
+    Hit(Output),
+    Miss(CacheMissReason),
+}
+
 /// Try to fetch the cached output for a hashed command.
 ///
 /// Returns the cached output if the command has been cached and none of the file dependencies have
@@ -440,141 +544,264 @@ impl From<db::EnvInputRow> for EnvInputDesc {
 async fn query_cached_output(
     pool: &SqlitePool,
     cmd_hash: &str,
+    raw_cmd: &str,
     extra_paths: &[PathBuf],
-) -> Result<Option<Output>, CommandError> {
+) -> Result<CacheCheckResult, CommandError> {
     let cached_cmd = db::get_command_by_hash(pool, cmd_hash)
         .await
         .map_err(CommandError::Sqlx)?;
 
-    if let Some(cmd) = cached_cmd {
-        trace!(
-            command_hash = cmd_hash,
-            "Found cached command, checking input states"
+    let Some(cmd) = cached_cmd else {
+        trace!(cmd = %raw_cmd, "cache miss: not cached");
+        return Ok(CacheCheckResult::Miss(CacheMissReason::NotCached));
+    };
+
+    trace!(cmd = %raw_cmd, "found cached command, checking inputs");
+
+    let files = db::get_files_by_command_id(pool, cmd.id)
+        .await
+        .map_err(CommandError::Sqlx)?;
+    let envs = db::get_envs_by_command_id(pool, cmd.id)
+        .await
+        .map_err(CommandError::Sqlx)?;
+
+    let old_inputs: Vec<Input> = files
+        .into_iter()
+        .map(Input::from)
+        .chain(envs.into_iter().map(Input::from))
+        .collect();
+
+    let extra_file_inputs = query_file_inputs(extra_paths).await;
+    let mut inputs: Vec<Input> = old_inputs.clone();
+    inputs.extend(extra_file_inputs.into_iter().map(Input::File));
+    inputs.sort();
+    inputs.dedup_by(Input::dedup);
+
+    let new_input_hash = Input::compute_input_hash(&inputs);
+
+    // Check if the set of tracked inputs changed
+    if cmd.input_hash != new_input_hash {
+        debug!(
+            cmd = %raw_cmd,
+            old_hash = %cmd.input_hash,
+            new_hash = %new_input_hash,
+            "cache miss: input hash mismatch"
         );
-        let files = db::get_files_by_command_id(pool, cmd.id)
-            .await
-            .map_err(CommandError::Sqlx)?;
 
-        let envs = db::get_envs_by_command_id(pool, cmd.id)
-            .await
-            .map_err(CommandError::Sqlx)?;
+        // Compare by identifier to find added/removed inputs
+        let old_ids: std::collections::HashSet<_> =
+            old_inputs.iter().map(|i| i.identifier()).collect();
+        let new_ids: std::collections::HashSet<_> = inputs.iter().map(|i| i.identifier()).collect();
 
-        let mut inputs = files
-            .into_iter()
-            .map(Input::from)
-            .chain(envs.into_iter().map(Input::from))
-            .collect::<Vec<_>>();
-
-        let extra_file_inputs = query_file_inputs(extra_paths)
-            .await
-            .into_iter()
-            .map(Input::File)
-            .collect::<Vec<_>>();
-
-        inputs.extend(extra_file_inputs);
-
-        inputs.sort();
-        inputs.dedup_by(Input::dedup);
-
-        let mut should_refresh = false;
-
-        let new_input_hash = Input::compute_input_hash(&inputs);
-
-        // Hash of input hashes do not match
-        if cmd.input_hash != new_input_hash {
-            debug!(
-                old_hash = cmd.input_hash,
-                new_hash = new_input_hash,
-                "Input hashes don't match. The inputs have been modified since the command was cached. Refreshing command."
-            );
-            trace!(inputs = ?inputs, "Inputs");
-
-            should_refresh = true;
+        let mut added_files = Vec::new();
+        let mut added_envs = Vec::new();
+        for added_id in new_ids.difference(&old_ids) {
+            match added_id {
+                InputIdentifier::File(path) => {
+                    debug!(cmd = %raw_cmd, path = ?path, "cache miss: new file tracked");
+                    added_files.push(path.clone());
+                }
+                InputIdentifier::Env(name) => {
+                    debug!(cmd = %raw_cmd, name = %name, "cache miss: new env var tracked");
+                    added_envs.push(name.clone());
+                }
+            }
         }
 
-        let inputs = Arc::new(inputs);
-
-        if !should_refresh {
-            let mut set = tokio::task::JoinSet::new();
-
-            for (index, _) in inputs.iter().enumerate() {
-                let inputs = Arc::clone(&inputs);
-                set.spawn_blocking(move || match &inputs[index] {
-                    Input::File(file) => {
-                        let res = check_file_state(file);
-                        (index, res)
-                    }
-                    Input::Env(env) => {
-                        let res = check_env_state(env);
-                        (index, res)
-                    }
-                });
+        let mut removed_files = Vec::new();
+        let mut removed_envs = Vec::new();
+        for removed_id in old_ids.difference(&new_ids) {
+            match removed_id {
+                InputIdentifier::File(path) => {
+                    debug!(cmd = %raw_cmd, path = ?path, "cache miss: file no longer tracked");
+                    removed_files.push(path.clone());
+                }
+                InputIdentifier::Env(name) => {
+                    debug!(cmd = %raw_cmd, name = %name, "cache miss: env var no longer tracked");
+                    removed_envs.push(name.clone());
+                }
             }
+        }
 
-            while let Some(res) = set.join_next().await {
-                if let Ok((index, Ok(file_state))) = res {
-                    let input = &inputs[index];
-                    match file_state {
-                        FileState::MetadataModified { modified_at, .. } => {
-                            if let Input::File(file) = &inputs[index] {
-                                trace!(
-                                    input = ?input,
-                                    modified_at = ?modified_at,
-                                    "File metadata has been modified, updating modified_at"
-                                );
-                                // TODO: batch with query builder?
-                                db::update_file_modified_at(pool, &file.path, modified_at)
-                                    .await
-                                    .map_err(CommandError::Sqlx)?;
-                            }
-                        }
-                        FileState::Modified {
-                            new_hash,
-                            modified_at,
-                        } => {
-                            trace!(
-                                input = ?input,
-                                new_hash,
-                                modified_at = ?modified_at,
-                                "Input has been modified, refreshing command"
+        // Check for modified inputs (same identifier, different hash)
+        let mut modified_files = Vec::new();
+        let mut modified_envs = Vec::new();
+        let old_map: std::collections::HashMap<_, _> = old_inputs
+            .iter()
+            .map(|i| (i.identifier(), i.content_hash()))
+            .collect();
+        let new_map: std::collections::HashMap<_, _> = inputs
+            .iter()
+            .map(|i| (i.identifier(), i.content_hash()))
+            .collect();
+
+        debug!(
+            cmd = %raw_cmd,
+            old_count = old_map.len(),
+            new_count = new_map.len(),
+            "comparing input hashes"
+        );
+
+        for (id, new_hash) in &new_map {
+            if let Some(old_hash) = old_map.get(id) {
+                if old_hash != new_hash {
+                    match id {
+                        InputIdentifier::File(path) => {
+                            debug!(
+                                cmd = %raw_cmd,
+                                path = ?path,
+                                old_hash = ?old_hash,
+                                new_hash = ?new_hash,
+                                "cache miss: file content changed"
                             );
-                            should_refresh = true;
+                            modified_files.push(path.clone());
                         }
-                        FileState::Removed => {
-                            trace!(
-                                input = ?input,
-                                "Input has been removed, refreshing command"
+                        InputIdentifier::Env(name) => {
+                            debug!(
+                                cmd = %raw_cmd,
+                                name = %name,
+                                old_hash = ?old_hash,
+                                new_hash = ?new_hash,
+                                "cache miss: env var content changed"
                             );
-                            should_refresh = true;
+                            modified_envs.push(name.clone());
                         }
-                        _ => (),
                     }
                 }
             }
+        }
+
+        // Return the most relevant reason
+        if !modified_files.is_empty() {
+            return Ok(CacheCheckResult::Miss(CacheMissReason::FilesModified {
+                paths: modified_files,
+            }));
+        }
+        if !added_files.is_empty() {
+            return Ok(CacheCheckResult::Miss(CacheMissReason::FilesModified {
+                paths: added_files,
+            }));
+        }
+        if !removed_files.is_empty() {
+            return Ok(CacheCheckResult::Miss(CacheMissReason::FilesRemoved {
+                paths: removed_files,
+            }));
+        }
+        if !modified_envs.is_empty() {
+            return Ok(CacheCheckResult::Miss(CacheMissReason::EnvModified {
+                names: modified_envs,
+            }));
+        }
+        if !added_envs.is_empty() {
+            return Ok(CacheCheckResult::Miss(CacheMissReason::EnvModified {
+                names: added_envs,
+            }));
+        }
+        if !removed_envs.is_empty() {
+            return Ok(CacheCheckResult::Miss(CacheMissReason::EnvRemoved {
+                names: removed_envs,
+            }));
+        }
+
+        // Otherwise, hash changed but we couldn't identify the specific input
+        return Ok(CacheCheckResult::Miss(CacheMissReason::InputsChanged));
+    }
+
+    let inputs = Arc::new(inputs);
+
+    // Check each input for modifications
+    let mut set = tokio::task::JoinSet::new();
+    for (index, _) in inputs.iter().enumerate() {
+        let inputs = Arc::clone(&inputs);
+        set.spawn_blocking(move || {
+            let state = match &inputs[index] {
+                Input::File(file) => check_file_state(file),
+                Input::Env(env) => check_env_state(env),
+            };
+            (index, state)
+        });
+    }
+
+    let mut modified_files = Vec::new();
+    let mut modified_envs = Vec::new();
+    let mut removed_files = Vec::new();
+    let mut removed_envs = Vec::new();
+
+    while let Some(res) = set.join_next().await {
+        let Ok((index, Ok(file_state))) = res else {
+            continue;
         };
 
-        if should_refresh {
-            Ok(None)
-        } else {
-            trace!("Command has not been modified, returning cached output");
-
-            db::update_command_updated_at(pool, cmd.id)
-                .await
-                .map_err(CommandError::Sqlx)?;
-
-            // No files have been modified, returning cached output
-            Ok(Some(Output {
-                status: process::ExitStatus::default(),
-                stdout: cmd.output,
-                stderr: Vec::new(),
-                inputs: Arc::try_unwrap(inputs).unwrap_or_else(|arc| (*arc).clone()),
-                cache_hit: true,
-            }))
+        match file_state {
+            FileState::MetadataModified { modified_at } => {
+                // mtime changed but content is the same - update the cached mtime
+                if let Input::File(file) = &inputs[index] {
+                    trace!(cmd = %raw_cmd, path = ?file.path, "mtime changed, content unchanged");
+                    db::update_file_modified_at(pool, &file.path, modified_at)
+                        .await
+                        .map_err(CommandError::Sqlx)?;
+                }
+            }
+            FileState::Modified { .. } => match &inputs[index] {
+                Input::File(file) => {
+                    debug!(cmd = %raw_cmd, path = ?file.path, "cache miss: file modified");
+                    modified_files.push(file.path.clone());
+                }
+                Input::Env(env) => {
+                    debug!(cmd = %raw_cmd, name = %env.name, "cache miss: env modified");
+                    modified_envs.push(env.name.clone());
+                }
+            },
+            FileState::Removed => match &inputs[index] {
+                Input::File(file) => {
+                    debug!(cmd = %raw_cmd, path = ?file.path, "cache miss: file removed");
+                    removed_files.push(file.path.clone());
+                }
+                Input::Env(env) => {
+                    debug!(cmd = %raw_cmd, name = %env.name, "cache miss: env removed");
+                    removed_envs.push(env.name.clone());
+                }
+            },
+            FileState::Unchanged => {}
         }
-    } else {
-        trace!(command_hash = cmd_hash, "Command not found in cache");
-        Ok(None)
     }
+
+    // Return the most relevant reason for cache miss
+    if !modified_files.is_empty() {
+        return Ok(CacheCheckResult::Miss(CacheMissReason::FilesModified {
+            paths: modified_files,
+        }));
+    }
+    if !removed_files.is_empty() {
+        return Ok(CacheCheckResult::Miss(CacheMissReason::FilesRemoved {
+            paths: removed_files,
+        }));
+    }
+    if !modified_envs.is_empty() {
+        return Ok(CacheCheckResult::Miss(CacheMissReason::EnvModified {
+            names: modified_envs,
+        }));
+    }
+    if !removed_envs.is_empty() {
+        return Ok(CacheCheckResult::Miss(CacheMissReason::EnvRemoved {
+            names: removed_envs,
+        }));
+    }
+
+    trace!(cmd = %raw_cmd, "cache hit");
+
+    db::update_command_updated_at(pool, cmd.id)
+        .await
+        .map_err(CommandError::Sqlx)?;
+
+    Ok(CacheCheckResult::Hit(Output {
+        status: process::ExitStatus::default(),
+        stdout: cmd.output,
+        stderr: Vec::new(),
+        inputs: Arc::try_unwrap(inputs).unwrap_or_else(|arc| (*arc).clone()),
+        cache_hit: true,
+        cache_miss_reason: None,
+    }))
 }
 
 async fn query_file_inputs(sources: &[PathBuf]) -> Vec<FileInputDesc> {

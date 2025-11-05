@@ -445,6 +445,7 @@ impl Nix {
                 stderr: output.stderr,
                 inputs: vec![],
                 cache_hit: false,
+                cache_miss_reason: None,
             }
         };
 

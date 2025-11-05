@@ -3,7 +3,9 @@ pub mod db;
 pub mod internal_log;
 pub mod op;
 
-pub use command::{EnvInputDesc, FileInputDesc, Input, NixCommand, Output, supports_eval_caching};
+pub use command::{
+    CacheMissReason, EnvInputDesc, FileInputDesc, Input, NixCommand, Output, supports_eval_caching,
+};
 pub use op::Op;
 
 /// Integration tests for caching behavior with Nix evaluation.

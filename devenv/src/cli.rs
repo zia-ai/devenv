@@ -130,6 +130,13 @@ pub struct GlobalOptions {
     #[arg(
         long,
         global = true,
+        help = "Show why the evaluation cache was invalidated."
+    )]
+    pub explain_cache: bool,
+
+    #[arg(
+        long,
+        global = true,
         help = "Disable substituters and consider all previously downloaded files up-to-date."
     )]
     pub offline: bool,
@@ -211,6 +218,7 @@ impl Default for GlobalOptions {
             eval_cache: true,
             no_eval_cache: false,
             refresh_eval_cache: false,
+            explain_cache: false,
             offline: false,
             clean: None,
             nix_debugger: false,

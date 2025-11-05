@@ -1520,37 +1520,57 @@ impl Devenv {
         Ok(())
     }
 
-    #[instrument(skip_all,fields(devenv.user_message = "Building shell"))]
     pub async fn get_dev_environment(&self, json: bool) -> Result<DevEnv> {
         self.assemble(false).await?;
 
         let gc_root = self.devenv_dot_gc.join("shell");
-        let span = tracing::debug_span!("evaluating_dev_env");
-        let env = self.nix.dev_env(json, &gc_root).instrument(span).await?;
 
-        use devenv_eval_cache::command::{FileInputDesc, Input};
-        util::write_file_with_lock(
-            self.devenv_dotfile.join("input-paths.txt"),
-            env.inputs
-                .iter()
-                .filter_map(|input| match input {
-                    Input::File(FileInputDesc { path, .. }) => {
-                        // We include --option in the eval cache, but we don't want it
-                        // to trigger direnv reload on each invocation
-                        let cli_options_path = self.devenv_dotfile.join("cli-options.nix");
-                        if path == &cli_options_path {
-                            return None;
+        // Start with a basic "Building shell" span
+        let span = tracing::info_span!(
+            "get_dev_environment",
+            devenv.user_message = "Building shell"
+        );
+        async move {
+            let inner_span = tracing::debug_span!("evaluating_dev_env");
+            let env = self
+                .nix
+                .dev_env(json, &gc_root)
+                .instrument(inner_span)
+                .await?;
+
+            // If explain_cache is enabled and there's a miss reason, show it as an info message
+            if self.global_options.explain_cache {
+                if let Some(reason) = &env.cache_miss_reason {
+                    info!(devenv.is_user_message = true, "Cache invalidated: {reason}");
+                }
+            }
+
+            use devenv_eval_cache::command::{FileInputDesc, Input};
+            util::write_file_with_lock(
+                self.devenv_dotfile.join("input-paths.txt"),
+                env.inputs
+                    .iter()
+                    .filter_map(|input| match input {
+                        Input::File(FileInputDesc { path, .. }) => {
+                            // We include --option in the eval cache, but we don't want it
+                            // to trigger direnv reload on each invocation
+                            let cli_options_path = self.devenv_dotfile.join("cli-options.nix");
+                            if path == &cli_options_path {
+                                return None;
+                            }
+                            Some(path.to_string_lossy().to_string())
                         }
-                        Some(path.to_string_lossy().to_string())
-                    }
-                    // TODO(sander): update direnvrc to handle env vars if possible
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )?;
+                        // TODO(sander): update direnvrc to handle env vars if possible
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )?;
 
-        Ok(DevEnv { output: env.stdout })
+            Ok(DevEnv { output: env.stdout })
+        }
+        .instrument(span)
+        .await
     }
 }
 
