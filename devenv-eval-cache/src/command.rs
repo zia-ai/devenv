@@ -642,6 +642,25 @@ async fn query_cached_output(
             "comparing input hashes"
         );
 
+        // Log a sample of inputs for debugging
+        let sample_size = 5;
+        trace!(
+            cmd = %raw_cmd,
+            "first {} old inputs: {:?}",
+            sample_size,
+            old_inputs.iter().take(sample_size).map(|i| {
+                format!("{:?} -> {:?}", i.identifier(), i.content_hash())
+            }).collect::<Vec<_>>()
+        );
+        trace!(
+            cmd = %raw_cmd,
+            "first {} new inputs: {:?}",
+            sample_size,
+            inputs.iter().take(sample_size).map(|i| {
+                format!("{:?} -> {:?}", i.identifier(), i.content_hash())
+            }).collect::<Vec<_>>()
+        );
+
         for (id, new_hash) in &new_map {
             if let Some(old_hash) = old_map.get(id) {
                 if old_hash != new_hash {
@@ -704,6 +723,18 @@ async fn query_cached_output(
         }
 
         // Otherwise, hash changed but we couldn't identify the specific input
+        debug!(
+            cmd = %raw_cmd,
+            old_hash = %cmd.input_hash,
+            new_hash = %new_input_hash,
+            old_count = old_map.len(),
+            new_count = new_map.len(),
+            added_files = added_files.len(),
+            added_envs = added_envs.len(),
+            removed_files = removed_files.len(),
+            removed_envs = removed_envs.len(),
+            "cache miss: tracked inputs changed (couldn't identify specific file - possible order change or DB partial update)"
+        );
         return Ok(CacheCheckResult::Miss(CacheMissReason::InputsChanged));
     }
 

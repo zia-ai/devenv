@@ -133,6 +133,27 @@ where
 {
     let mut conn = conn.acquire().await?;
 
+    // First, get the command details for logging
+    let existing_cmd = sqlx::query_as::<_, CommandRow>(
+        r#"
+        SELECT id, raw, cmd_hash, input_hash, output, updated_at
+        FROM cached_cmd
+        WHERE cmd_hash = ?
+        "#,
+    )
+    .bind(cmd_hash)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    if let Some(cmd) = existing_cmd {
+        tracing::debug!(
+            cmd = %cmd.raw,
+            cmd_hash = %cmd_hash,
+            old_input_hash = %cmd.input_hash,
+            "deleting cached command (being replaced with new evaluation)"
+        );
+    }
+
     sqlx::query(
         r#"
         DELETE FROM cached_cmd
